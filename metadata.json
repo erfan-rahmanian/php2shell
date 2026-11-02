@@ -1,0 +1,6 @@
+{
+  "name": "PHP2Shell Technical Research Deck",
+  "description": "ارائه تخصصی و تحلیل فنی آسیب‌پذیری‌های بحرانی PHP2Shell (CVE-2026-109618 & CVE-2026-109619) به همراه دیاگرام‌های معماری حافظه، SOC Detection و خروجی PowerPoint (.pptx)",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,904 @@
+PHP2Shell: Critical Remote Code Execution Vulnerabilities in PHP Runtime
+Technical Deep Dive into CVE-2026-109618 & CVE-2026-109619
+نوع ارائه: Technical Security Research / Vulnerability Analysis / SOC Investigation
+مخاطبان: SOC Analysts، Security Engineers، Penetration Testers و متخصصان امنیت وب
+مطالعه موردی: TryHackMe PHP2Shell Lab
+نسخه هدف در آزمایشگاه: PHP 8.4.26
+نسخه اصلاح‌شده: PHP 8.4.27
+
+بخش اول: مقدمه و شناخت آسیب‌پذیری
+اسلاید ۱ ـ عنوان ارائه
+PHP2Shell: From Memory Corruption to Remote Code Execution
+تحلیل فنی دو آسیب‌پذیری بحرانی در PHP با شناسه‌های:
+- CVE-2026-109618
+- CVE-2026-109619
+موضوعات اصلی:
+- PHP Runtime Internals
+- Session Upload Progress
+- Out Of Memory (OOM)
+- Bailout و longjmp()
+- Dangling Pointer و Use-After-Free
+- Memory Disclosure
+- ASLR Bypass
+- Remote Code Execution
+- Detection و Incident Response
+- Mitigation و Remediation
+
+اسلاید ۲ ـ معرفی PHP2Shell
+PHP2Shell نامی است که برای مجموعه‌ای از آسیب‌پذیری‌های بحرانی در PHP Runtime استفاده می‌شود.
+این آسیب‌پذیری‌ها امکان اجرای کد از راه دور (Remote Code Execution) را در شرایط مشخصی فراهم می‌کنند.
+نکته مهم این است که منشأ آسیب‌پذیری در خود PHP Engine و نحوه مدیریت حافظه و وضعیت داخلی Request قرار دارد، نه لزوماً در کد Application.
+بنابراین ممکن است یک وب‌سایت از نظر امنیتی به‌خوبی توسعه داده شده باشد و هیچ آسیب‌پذیری مستقیمی در Source Code آن وجود نداشته باشد، اما همچنان به دلیل استفاده از نسخه آسیب‌پذیر PHP در معرض خطر قرار بگیرد.
+مشخصات امنیتی:
+- نوع آسیب‌پذیری: Remote Code Execution
+- سطح دسترسی اولیه موردنیاز: بدون Authentication
+- نوع تعامل کاربر: بدون نیاز به User Interaction
+- سطح اثرگذاری: Confidentiality، Integrity و Availability
+- شدت گزارش‌شده: Critical
+- CVSS v4.0: 9.2
+دو آسیب‌پذیری اصلی از نظر Root Cause متفاوت هستند، اما هر دو به مشکلات مدیریت وضعیت داخلی PHP در شرایط خطا مربوط می‌شوند.
+
+اسلاید ۳ ـ چرا این آسیب‌پذیری مهم است؟
+در معماری معمول یک Web Application، امنیت سیستم فقط به کد برنامه وابسته نیست.
+لایه‌های مختلفی در اجرای یک Application نقش دارند:
+1. Operating System
+2. Web Server مانند Apache یا Nginx
+3. PHP Runtime
+4. Framework مانند Laravel یا Symfony
+5. Application Code
+6. Database و سایر سرویس‌های وابسته
+در بسیاری از بررسی‌های امنیتی تمرکز اصلی روی Application Code است؛ برای مثال:
+- SQL Injection
+- Cross-Site Scripting
+- Authentication Bypass
+- Insecure File Upload
+- Broken Access Control
+اما PHP2Shell نشان می‌دهد که آسیب‌پذیری در لایه Runtime می‌تواند تمام Applicationهایی را که از آن Runtime استفاده می‌کنند تحت تأثیر قرار دهد.
+مثال:
+فرض کنید یک سازمان از WordPress، Laravel و یک Application اختصاصی PHP استفاده می‌کند.
+اگر هر سه Application روی یک PHP Runtime آسیب‌پذیر اجرا شوند، سالم بودن کد هر سه برنامه به‌تنهایی مانع سوءاستفاده از نقص Runtime نخواهد شد.
+پیام اصلی: امنیت Application بدون امنیت Runtime کامل نیست.
+
+اسلاید ۴ ـ آشنایی با مفاهیم پایه
+برای درک PHP2Shell باید ابتدا چند مفهوم را بشناسیم.
+PHP Runtime
+محیط اجرایی PHP که مسئول پردازش Request، مدیریت حافظه، اجرای کد و مدیریت متغیرها و Objectها است.
+Zend Engine
+موتور داخلی PHP که مسئول Compile و اجرای کد PHP و مدیریت ساختارهای داده و حافظه است.
+Session
+مکانیزمی برای نگهداری وضعیت کاربران بین Requestهای مختلف.
+Multipart/Form-Data
+یک Content-Type در HTTP که معمولاً برای ارسال فایل و Form Data استفاده می‌شود.
+Memory Corruption
+وضعیتی که در آن ساختارها یا محتوای حافظه به شکل غیرمنتظره تغییر می‌کنند.
+Dangling Pointer
+اشاره‌گری که همچنان به یک آدرس حافظه اشاره می‌کند، درحالی‌که حافظه مربوط به آن آزاد شده یا دیگر اعتبار ندارد.
+Use-After-Free
+استفاده مجدد از حافظه پس از آزاد شدن آن.
+Memory Disclosure
+افشای اطلاعاتی از حافظه Process به یک موجودیت غیرمجاز.
+ASLR
+مکانیزمی برای تصادفی‌سازی آدرس بخش‌های مختلف حافظه.
+RCE
+توانایی اجرای دستور یا کد دلخواه روی سیستم هدف.
+
+اسلاید ۵ ـ معماری اجرای PHP در Web Server
+PHP می‌تواند با معماری‌ها و SAPIهای مختلف در Web Server اجرا شود.
+مهم‌ترین حالت‌ها عبارت‌اند از:
+- Apache mod_php
+- PHP-FPM
+- CGI
+- FastCGI
+- FrankenPHP
+در آزمایشگاه TryHackMe از Apache همراه با mod_php استفاده شده است.
+در این معماری، PHP مستقیماً داخل Process مربوط به Apache اجرا می‌شود.
+ساختار ساده‌شده:
+Client
+↓
+HTTP Request
+↓
+Apache Web Server
+↓
+mod_php
+↓
+PHP Runtime / Zend Engine
+↓
+Application Code
+↓
+HTTP Response
+در این معماری، Apache مسئول دریافت درخواست و تحویل آن به PHP است.
+PHP نیز Request را پردازش کرده و در نهایت Response تولید می‌کند.
+نکته مهم این است که بخشی از پردازش Request قبل از اجرای Application Code انجام می‌شود.
+همین موضوع یکی از عوامل مهم در قابل‌استفاده بودن مسیر حمله PHP2Shell است.
+
+اسلاید ۶ ـ معرفی Session Upload Progress
+PHP قابلیتی به نام session.upload_progress دارد.
+هدف از طراحی این قابلیت، نمایش میزان پیشرفت Upload فایل‌های حجیم به کاربران است.
+هنگامی که Browser فایلی را Upload می‌کند، PHP می‌تواند اطلاعات مربوط به پیشرفت عملیات را در Session ذخیره کند.
+اطلاعات ثبت‌شده می‌توانند شامل موارد زیر باشند:
+- نام فایل
+- حجم فایل
+- تعداد بایت‌های دریافت‌شده
+- وضعیت پیشرفت Upload
+- اطلاعات مربوط به Form
+یک درخواست HTTP از نوع Multipart می‌تواند باعث فعال شدن این مکانیزم شود.
+نام پیش‌فرض Form Field مربوط به فعال‌سازی این قابلیت:
+PHP_SESSION_UPLOAD_PROGRESS
+تنظیم مربوط به این نام در PHP:
+session.upload_progress.name
+مقدار پیش‌فرض:
+PHP_SESSION_UPLOAD_PROGRESS
+تنظیم فعال یا غیرفعال بودن قابلیت:
+session.upload_progress.enabled
+مقدار پیش‌فرض این تنظیم در PHP:
+On
+نکته امنیتی:
+این قابلیت به‌خودی‌خود آسیب‌پذیر نیست؛ مشکل اصلی در نحوه مدیریت وضعیت داخلی PHP هنگام بروز شرایط خطا در حین پردازش Request است.
+
+اسلاید ۷ ـ چرا Upload Progress از نظر امنیتی اهمیت دارد؟
+نکته کلیدی، زمان اجرای Upload Progress است.
+هنگامی که PHP یک Request از نوع multipart/form-data دریافت می‌کند، ابتدا باید بدنه Request را پردازش کند.
+این عملیات شامل خواندن Form Fieldها و اطلاعات فایل‌های ارسالی است.
+در جریان این پردازش، PHP می‌تواند اطلاعات Upload Progress را در Session ثبت کند.
+نکته مهم این است که این عملیات در مراحل اولیه پردازش Request انجام می‌شود.
+یعنی قبل از اینکه PHP کد اصلی Application را اجرا کند.
+بنابراین در شرایط حمله‌ای که به این مسیر وابسته است، لزوماً نیازی به وجود موارد زیر نیست:
+- Login Form
+- Authentication
+- Session Management اختصاصی در Application
+- File Upload Handler در کد Application
+- آسیب‌پذیری در Source Code وب‌سایت
+نتیجه امنیتی:
+Attack Surface می‌تواند در سطح PHP Runtime وجود داشته باشد، حتی اگر Application هیچ قابلیت Upload مشخصی نداشته باشد.
+
+اسلاید ۸ ـ چرخه پردازش HTTP Request در PHP
+برای درک آسیب‌پذیری باید ترتیب کلی پردازش Request را بشناسیم.
+مراحل ساده‌شده:
+1. دریافت HTTP Request توسط Web Server
+2. تحویل Request به PHP SAPI
+3. پردازش Headerها
+4. پردازش Request Body
+5. پردازش Multipart و Upload Progress
+6. آماده‌سازی Request Environment
+7. مقداردهی اولیه متغیرها و Session
+8. اجرای Application Script
+9. تولید Response
+10. آزادسازی منابع و پایان Request
+نکته مهم:
+برخی عملیات مربوط به Request Body قبل از اجرای Application Code اتفاق می‌افتند.
+بنابراین اگر آسیب‌پذیری در یکی از مراحل اولیه PHP Runtime وجود داشته باشد، ممکن است کد Application اصلاً فرصت اجرا پیدا نکند.
+ارتباط با PHP2Shell:
+مسیر سوءاستفاده از مراحل داخلی پردازش Request استفاده می‌کند، نه از منطق تجاری Application.
+
+بخش دوم: Root Cause و Memory Corruption
+اسلاید ۹ ـ آشنایی با Memory Limit در PHP
+PHP برای جلوگیری از مصرف بیش از حد حافظه توسط هر Request، تنظیمی به نام memory_limit دارد.
+این تنظیم حداکثر میزان حافظه قابل‌مصرف توسط یک Script را مشخص می‌کند.
+مثال:
+memory_limit = 128M
+یعنی PHP برای آن Request محدودیت حافظه‌ای در حدود 128 مگابایت اعمال می‌کند.
+اگر یک عملیات باعث شود مصرف حافظه از این حد عبور کند، PHP نمی‌تواند اجرای عادی را ادامه دهد.
+در این شرایط خطایی مشابه زیر ایجاد می‌شود:
+Fatal error: Allowed memory size exhausted
+این مکانیزم برای جلوگیری از Memory Exhaustion و محافظت از منابع سرور طراحی شده است.
+اما نحوه خروج PHP از مسیر اجرای فعلی در شرایط Out Of Memory اهمیت امنیتی پیدا می‌کند.
+
+اسلاید ۱۰ ـ مفهوم Bailout و longjmp()
+PHP برای خروج اضطراری از برخی مسیرهای اجرایی، از مکانیزمی به نام Bailout استفاده می‌کند.
+این مکانیزم از تابع longjmp() در C بهره می‌برد.
+longjmp() امکان بازگشت غیرمعمول به یک نقطه مشخص در مسیر اجرای برنامه را فراهم می‌کند.
+به زبان ساده، هنگامی که PHP با شرایط بحرانی مانند Out Of Memory مواجه می‌شود، می‌تواند اجرای مسیر فعلی را متوقف کرده و به نقطه بازیابی مشخصی بازگردد.
+نام این عملیات در PHP:
+Bailout
+مشکل امنیتی زمانی ایجاد می‌شود که این خروج اضطراری باعث شود برخی مراحل Cleanup یا Reset به شکل مورد انتظار اجرا نشوند.
+در نتیجه ممکن است ساختارهای داخلی PHP در وضعیت ناقص یا ناسازگار باقی بمانند.
+نکته مهم:
+Bailout به‌خودی‌خود آسیب‌پذیری نیست. مشکل در نحوه مدیریت وضعیت و منابع هنگام خروج اضطراری است.
+
+اسلاید ۱۱ ـ تفاوت Normal Cleanup و Emergency Bailout
+در اجرای عادی یک Request، PHP پس از پایان پردازش باید منابع مصرف‌شده را آزاد کند.
+این منابع می‌توانند شامل موارد زیر باشند:
+- Heap Allocations
+- Temporary Variables
+- Session Data
+- Internal Objects
+- Request-specific Structures
+در یک مسیر Cleanup سالم:
+1. منابع شناسایی می‌شوند.
+2. حافظه آزاد می‌شود.
+3. Pointerهای مربوطه Reset می‌شوند.
+4. وضعیت داخلی به حالت معتبر بازمی‌گردد.
+5. Request خاتمه پیدا می‌کند.
+اما در یک مسیر اضطراری ممکن است عملیات Cleanup ناقص باقی بماند.
+برای مثال:
+- یک بخش از حافظه آزاد شده است.
+- Pointer مربوطه هنوز Reset نشده است.
+- Process همچنان Pointer قدیمی را در حافظه نگه می‌دارد.
+این وضعیت می‌تواند به Dangling Pointer منجر شود.
+تفاوت اصلی:
+Normal Cleanup یک فرآیند کنترل‌شده است؛ اما Bailout می‌تواند مسیر معمول پاک‌سازی را قطع کند.
+
+اسلاید ۱۲ ـ Dangling Pointer چیست؟
+Pointer متغیری است که آدرس یک بخش از حافظه را نگهداری می‌کند.
+فرض کنید یک Process حافظه‌ای را تخصیص داده است:
+Pointer A → Memory Block A
+پس از استفاده، حافظه آزاد می‌شود:
+free(Memory Block A)
+اما Pointer هنوز همان آدرس قبلی را نگه داشته است.
+در نتیجه:
+Pointer A → Freed Memory
+این Pointer اکنون یک Dangling Pointer است.
+اگر برنامه دوباره از طریق این Pointer به حافظه دسترسی پیدا کند، ممکن است به داده‌ای دسترسی پیدا کند که دیگر متعلق به آن Object نیست.
+این مشکل می‌تواند منجر به موارد زیر شود:
+- Crash
+- Memory Corruption
+- Information Disclosure
+- Arbitrary Code Execution
+نکته مهم:
+Dangling Pointer و Use-After-Free مفاهیم مرتبط هستند، اما دقیقاً یکسان نیستند.
+Dangling Pointer به Pointer نامعتبر اشاره می‌کند؛ Use-After-Free زمانی اتفاق می‌افتد که از حافظه آزادشده مجدداً استفاده شود.
+
+اسلاید ۱۳ ـ Use-After-Free و ارتباط آن با PHP2Shell
+Use-After-Free یکی از کلاس‌های مهم Memory Corruption است.
+این مشکل زمانی اتفاق می‌افتد که برنامه بعد از آزاد کردن یک بخش از حافظه، همچنان از Reference یا Pointer قبلی استفاده کند.
+سناریوی ساده:
+1. Application یک Object در Heap ایجاد می‌کند.
+2. Object دیگر موردنیاز نیست.
+3. حافظه Object آزاد می‌شود.
+4. Pointer قدیمی همچنان باقی می‌ماند.
+5. حافظه آزادشده توسط Allocation دیگری اشغال می‌شود.
+6. برنامه از Pointer قدیمی استفاده می‌کند.
+7. داده جدید به‌اشتباه به‌عنوان Object قبلی تفسیر می‌شود.
+در PHP2Shell، مشکلات مربوط به وضعیت داخلی Request و عمر حافظه باعث می‌شوند Pointerها یا Stateهای نامعتبر در شرایط خاص مورد استفاده مجدد قرار بگیرند.
+این موضوع می‌تواند مسیر Memory Disclosure یا Code Execution را ایجاد کند.
+طبقه‌بندی مرتبط:
+CWE-416: Use After Free
+CWE-755: Improper Handling of Exceptional Conditions
+CWE-824: Access of Uninitialized Pointer
+این ضعف‌ها در تحلیل Root Cause آسیب‌پذیری‌ها اهمیت دارند.
+
+اسلاید ۱۴ ـ نقش Apache Prefork و Worker Reuse
+Apache می‌تواند با MPMهای مختلف اجرا شود.
+یکی از مدل‌های مهم آن Prefork است.
+در مدل Prefork، Apache چندین Child Process ایجاد می‌کند و هر Process می‌تواند درخواست‌های مختلف را در طول عمر خود پردازش کند.
+در ترکیب Apache Prefork و mod_php:
+- PHP داخل Process مربوط به Apache اجرا می‌شود.
+- Worker پس از پایان هر Request لزوماً Restart نمی‌شود.
+- اطلاعات و Stateهای Persistent می‌توانند بین Requestها باقی بمانند.
+- در صورت باقی ماندن Pointer یا State نامعتبر، Request بعدی ممکن است با آن مواجه شود.
+چرا این موضوع مهم است؟
+فرض کنید:
+Request 1:
+- باعث ایجاد خطای حافظه می‌شود.
+- یک Pointer نامعتبر باقی می‌گذارد.
+- Request خاتمه پیدا می‌کند.
+Request 2:
+- به همان Worker ارسال می‌شود.
+- Worker هنوز State قبلی را در حافظه دارد.
+- عملیات بعدی ممکن است از State نامعتبر استفاده کند.
+این همان مفهوم Worker Reuse است.
+در آزمایشگاه TryHackMe تعداد Workerها به یک عدد محدود شده است تا رفتار موردنظر قابل‌تکرارتر باشد.
+البته این محدودیت، ویژگی اختصاصی آزمایشگاه است و نباید آن را به تمام محیط‌های Production تعمیم داد.
+
+بخش سوم: تحلیل CVEها و Attack Chain
+اسلاید ۱۵ ـ معرفی دو CVE اصلی
+PHP2Shell شامل دو آسیب‌پذیری اصلی است.
+CVE-2026-109618
+عنوان: RCE via Out-of-Memory Corruption
+ریشه مشکل:
+مدیریت ناقص وضعیت داخلی PHP هنگام وقوع Out Of Memory در زمانی که برخی ساختارهای Request هنوز به‌طور کامل مقداردهی اولیه نشده‌اند.
+در نتیجه مسیر Shutdown ممکن است با State نامعتبر کار کند.
+CVE-2026-109619
+عنوان: RCE via Stale Global State
+ریشه مشکل:
+باقی ماندن Stateهای داخلی متعلق به یک Request پس از آزاد شدن حافظه آن Request.
+در نتیجه Request بعدی ممکن است قبل از Reset شدن State، از اطلاعات قدیمی استفاده کند.
+نکته مهم
+هر دو آسیب‌پذیری به مدیریت State و Bailout مربوط هستند، اما Trigger و Root Cause دقیق آن‌ها متفاوت است.
+در آزمایشگاه، زنجیره عملی Exploitation شامل Memory Disclosure و RCE نیز نمایش داده می‌شود.
+نباید مراحل یک PoC خاص را با تعریف رسمی Root Cause هر CVE یکسان فرض کرد.
+
+اسلاید ۱۶ ـ تحلیل CVE-2026-109618
+این آسیب‌پذیری مربوط به Out Of Memory Corruption است.
+PHP هنگام پردازش Request ممکن است به دلیل مصرف حافظه با OOM مواجه شود.
+در برخی مسیرها، Request Memory پیش از آنکه کاملاً Initialize شود، در اختیار بخش‌های دیگر Runtime قرار می‌گیرد.
+اگر در این مرحله Allocation شکست بخورد، PHP با استفاده از مسیر اضطراری Bailout از اجرای فعلی خارج می‌شود.
+اما State ناقص ممکن است در حافظه باقی بماند.
+در ادامه، فرآیند Shutdown ممکن است به State نامعتبر دسترسی پیدا کند.
+این وضعیت می‌تواند منجر به Memory Corruption و در شرایط قابل‌استفاده به Remote Code Execution شود.
+نکات امنیتی:
+- نیاز نداشتن به Authentication در مسیرهای تأییدشده
+- امکان Trigger از طریق Request Parsing
+- اهمیت Multipart Parsing
+- نقش Out Of Memory
+- اهمیت مدیریت صحیح Exception و Cleanup
+این آسیب‌پذیری نشان می‌دهد که حتی مکانیزم‌های حفاظتی مانند Memory Limit نیز اگر به‌درستی با سایر اجزای Runtime هماهنگ نشده باشند، می‌توانند در شرایط خاص به بخشی از Attack Surface تبدیل شوند.
+
+اسلاید ۱۷ ـ تحلیل CVE-2026-109619
+این آسیب‌پذیری به Stale Global State مربوط است.
+در این سناریو برخی Stateهای داخلی که متعلق به یک Request هستند، در سطح Worker باقی می‌مانند.
+در حالت طبیعی، پس از پایان Request باید Stateهای مربوطه Reset شوند.
+اما اگر یک Fatal Error یا شرایط مشابه باعث قطع مسیر عادی Cleanup شود، ممکن است State قدیمی همچنان باقی بماند.
+در نتیجه Request بعدی می‌تواند قبل از مقداردهی اولیه مجدد، به State قدیمی دسترسی پیدا کند.
+در برخی مسیرهای تأییدشده، session.upload_progress نقش مهمی در رسیدن به این وضعیت دارد.
+مفاهیم کلیدی:
+- Global State
+- Request Lifecycle
+- Worker Reuse
+- Heap Lifetime
+- Stale Reference
+- Use-After-Free
+تفاوت این آسیب‌پذیری با CVE قبلی در نوع State نامعتبر و شرایطی است که باعث باقی ماندن آن می‌شوند.
+
+اسلاید ۱۸ ـ Attack Chain در PHP2Shell
+زنجیره کلی حمله در آزمایشگاه به شکل زیر نمایش داده می‌شود:
+مرحله اول: Attacker یک Multipart HTTP Request ارسال می‌کند.
+مرحله دوم: PHP در جریان Request Parsing، Upload Progress را پردازش می‌کند.
+مرحله سوم: شرایطی برای Out Of Memory و Bailout ایجاد می‌شود.
+مرحله چهارم: State یا Pointer نامعتبر باقی می‌ماند.
+مرحله پنجم: درخواست بعدی باعث استفاده مجدد از حافظه یا State می‌شود.
+مرحله ششم: در مسیر PoC آزمایشگاه، Memory Disclosure برای استخراج اطلاعات حافظه انجام می‌شود.
+مرحله هفتم: اطلاعات افشاشده برای دور زدن ASLR استفاده می‌شوند.
+مرحله هشتم: ساختارهای داخلی حافظه در مسیر Exploit دست‌کاری می‌شوند.
+مرحله نهم: جریان اجرای PHP تحت تأثیر قرار می‌گیرد.
+مرحله دهم: Remote Code Execution با سطح دسترسی Worker اتفاق می‌افتد.
+نتیجه نهایی:
+Unauthenticated Remote Code Execution در محیط آسیب‌پذیر و تحت شرایط Exploit مورد آزمایش.
+
+اسلاید ۱۹ ـ Memory Disclosure از طریق PHPSESSID
+یکی از مراحل مهم PoC آزمایشگاه، Memory Disclosure است.
+در این روش، وضعیت نامعتبر Session ID باعث می‌شود PHP اطلاعاتی بیشتر از مقدار مورد انتظار را پردازش کند.
+در مسیر نمایش‌داده‌شده توسط آزمایشگاه، مقدار Session ID به شکلی با طول غیرعادی خوانده می‌شود و داده‌های مجاور حافظه نیز به Response منتقل می‌شوند.
+این اطلاعات از طریق HTTP Response Header زیر مشاهده می‌شوند:
+Set-Cookie: PHPSESSID=...
+در حالت عادی Session ID باید طول و ساختار متناسب با تنظیمات PHP داشته باشد.
+اما در مسیر Memory Disclosure، ممکن است مقدار Cookie غیرعادی بزرگ شود و بخشی از داده‌های حافظه Process را افشا کند.
+این اطلاعات می‌توانند شامل داده‌های حساس یا آدرس‌های حافظه باشند.
+نکته امنیتی:
+افشای Memory می‌تواند اطلاعاتی مانند موارد زیر را در معرض خطر قرار دهد:
+- Session Data
+- Authentication Tokens
+- API Keys
+- Application Secrets
+- Memory Addresses
+میزان و نوع اطلاعات افشاشده به شرایط حافظه و مسیر Exploit بستگی دارد.
+
+اسلاید ۲۰ ـ ASLR چیست و چرا مهم است؟
+ASLR مخفف Address Space Layout Randomization است.
+این مکانیزم امنیتی در سیستم‌عامل‌های مدرن برای تصادفی‌سازی آدرس بخش‌های مختلف حافظه استفاده می‌شود.
+هدف ASLR این است که مهاجم نتواند آدرس دقیق بخش‌های مهم برنامه را از قبل پیش‌بینی کند.
+بخش‌هایی که می‌توانند تحت تأثیر ASLR قرار بگیرند:
+- Stack
+- Heap
+- Shared Libraries
+- Executable Memory Regions
+فرض کنید یک Library در یک اجرا در آدرس مشخصی بارگذاری شود.
+در اجرای بعدی ممکن است Base Address آن متفاوت باشد.
+در نتیجه مهاجم نمی‌تواند صرفاً با استفاده از آدرس‌های ثابت، جریان اجرای برنامه را تغییر دهد.
+نقش Memory Disclosure:
+اگر مهاجم بتواند آدرس‌های واقعی حافظه را افشا کند، بخشی از اثربخشی ASLR کاهش پیدا می‌کند.
+بنابراین Memory Disclosure می‌تواند به‌عنوان مرحله مقدماتی برای Exploitation پیشرفته‌تر مورد استفاده قرار بگیرد.
+
+اسلاید ۲۱ ـ ASLR Bypass در PoC آزمایشگاه
+در PoC نمایش‌داده‌شده در TryHackMe، Memory Disclosure در دو مرحله انجام می‌شود.
+مرحله اول:
+استخراج Base Address مربوط به Heap.
+مرحله دوم:
+استخراج Base Address مربوط به کتابخانه PHP یعنی libphp.
+نمونه خروجی:
+[+] chunk base = 0x70d1a2c00000
+[+] libphp base = 0x70d1a4911000
+این آدرس‌ها صرفاً نمونه هستند و در هر اجرای جدید ممکن است تغییر کنند.
+چرا؟
+چون ASLR در هر اجرا آدرس‌های حافظه را تصادفی می‌کند.
+Exploit به‌جای حدس زدن آدرس‌ها، اطلاعات موردنیاز را از طریق Memory Disclosure استخراج می‌کند.
+در نتیجه می‌تواند محاسبات وابسته به Base Address را برای همان محیط اجرایی انجام دهد.
+نکته:
+این مرحله به Build، معماری، Layout حافظه و Offsetهای همان محیط وابسته است. بنابراین PoC الزاماً روی تمام نسخه‌ها و Buildهای PHP به شکل یکسان اجرا نمی‌شود.
+
+اسلاید ۲۲ ـ از Memory Corruption تا RCE
+در این مرحله هدف دیگر صرفاً خواندن اطلاعات حافظه نیست.
+هدف، تأثیرگذاری روی Control Flow برنامه است.
+در PoC مورد استفاده در آزمایشگاه، از ساختارهای داخلی PHP و Pointerهای مرتبط با آن‌ها استفاده می‌شود.
+یکی از مفاهیم مورد استفاده، HashTable است.
+HashTable یکی از ساختارهای داده داخلی PHP برای نگهداری مجموعه‌ای از مقادیر است.
+در سناریوی توضیح‌داده‌شده در آزمایشگاه، ساختار حافظه به شکلی دست‌کاری می‌شود که Pointer مربوط به Destructor یعنی pDestructor تحت کنترل Exploit قرار بگیرد.
+در PoC این آزمایشگاه، آدرس تابع system() به‌عنوان مقصد موردنظر در نظر گرفته می‌شود.
+هنگامی که PHP عملیات Cleanup را انجام می‌دهد، به‌جای اجرای Destructor مورد انتظار، مسیر اجرای موردنظر Exploit فعال می‌شود.
+در نتیجه دستور کنترل‌شده توسط مهاجم اجرا می‌شود.
+نکته فنی مهم:
+این توضیح مربوط به مسیر Exploit آزمایشگاه است؛ نباید تصور کرد تمام مسیرهای PHP2Shell یا تمام Buildهای PHP دقیقاً با همین HashTable و Pointer به system() مورد سوءاستفاده قرار می‌گیرند.
+
+اسلاید ۲۳ ـ Remote Code Execution و سطح دسترسی
+پس از موفقیت Exploit، مهاجم می‌تواند دستوراتی را با سطح دسترسی Process مربوط به PHP یا Web Server اجرا کند.
+در محیط آزمایشگاه، خروجی اثبات اجرای دستور به شکل زیر است:
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+این خروجی نشان می‌دهد که دستور با کاربر زیر اجرا شده است:
+www-data
+این کاربر معمولاً برای اجرای سرویس‌های Web Server در سیستم‌های مبتنی بر Debian و Ubuntu استفاده می‌شود.
+آیا RCE به معنی Root Access است؟
+خیر.
+RCE به معنی توانایی اجرای کد روی سیستم هدف است، نه الزاماً دسترسی Root.
+سطح دسترسی مهاجم به مجوزهای Process آسیب‌پذیر بستگی دارد.
+اگر Worker با دسترسی محدود اجرا شود، مهاجم نیز در حالت عادی همان سطح دسترسی را به دست می‌آورد.
+اگر PHP به اشتباه با دسترسی Root اجرا شود، اثر حمله بسیار شدیدتر خواهد بود.
+
+بخش چهارم: بازسازی عملی آزمایشگاه TryHackMe
+اسلاید ۲۴ ـ معرفی محیط آزمایشگاه
+محیط مورد استفاده در TryHackMe از اجزای زیر تشکیل شده است:
+- Ubuntu 24.04
+- Docker
+- Apache
+- PHP 8.4.26
+- Apache mod_php
+- Container Name: php2shell-target
+- HTTP Service: 127.0.0.1:8088
+ماشین هدف یک Docker Container اجرا می‌کند.
+برای دسترسی به آن ابتدا از طریق SSH وارد Ubuntu می‌شویم.
+نمونه دستور:
+ssh ubuntu@MACHINE_IP
+پس از ورود، باید توجه داشته باشیم که:
+- SSH برای اتصال به ماشین و معمولاً روی پورت 22 است.
+- HTTP Server روی پورت 8088 در دسترس است.
+- پورت 8088 مربوط به SSH نیست.
+- درخواست‌های آزمایشگاه از داخل خود ماشین به 127.0.0.1:8088 ارسال می‌شوند.
+
+اسلاید ۲۵ ـ شناسایی Target و بررسی نسخه PHP
+ابتدا Containerهای فعال را بررسی می‌کنیم:
+docker ps --format '{{.Names}} {{.Image}} {{.Status}}'
+خروجی مورد انتظار:
+php2shell-target php:8.4.26-apache Up
+سپس نسخه PHP داخل Container را بررسی می‌کنیم:
+docker exec php2shell-target php -v
+خروجی:
+PHP 8.4.26
+این نسخه در شاخه PHP 8.4، پیش از نسخه اصلاح‌شده 8.4.27 قرار دارد.
+در نتیجه هدف آزمایشگاه از نظر نسخه PHP در محدوده آسیب‌پذیر مورد بررسی قرار می‌گیرد.
+
+اسلاید ۲۶ ـ بررسی Application و Attack Surface
+ابتدا پاسخ Web Server را بررسی می‌کنیم:
+curl -s http://127.0.0.1:8088/index.php
+خروجی:
+OK
+حالا Source Code صفحه را مشاهده می‌کنیم:
+docker exec php2shell-target cat /var/www/html/index.php
+کد صفحه:
+<?php echo "OK\n"; ?>
+این Application هیچ منطق پیچیده‌ای ندارد.
+در آن خبری از:
+- Authentication
+- File Upload Handler
+- Database Query
+- User Input Processing
+- Application-level Vulnerability
+نیست.
+نتیجه:
+این آزمایشگاه نشان می‌دهد که نقص در PHP Runtime قرار دارد و برای مسیر حمله نمایش‌داده‌شده، وجود آسیب‌پذیری در منطق Application ضروری نیست.
+
+اسلاید ۲۷ ـ بررسی Exploit و اجرای آزمایش
+فایل‌های آزمایشگاه از قبل در Home Directory کاربر Ubuntu قرار دارند.
+برای مشاهده فایل‌ها:
+ls -lah ~/php2shell-bypass-aslr-exp
+محتویات مهم:
+- exploit.py
+- README.md
+- readme_en.md
+- src
+- tools
+- out
+برای اجرای PoC در محیط مجاز آزمایشگاه:
+cd ~/php2shell-bypass-aslr-exp
+سپس:
+python3 exploit.py -u http://127.0.0.1:8088/index.php
+در اجرای موفق، خروجی شامل مراحل زیر است:
+- Worker Rotation
+- Heap Leak
+- libphp Leak
+- Exploitation Stage
+- Execution Proof
+در پایان ممکن است خروجی شبیه زیر مشاهده شود:
+PROOF: uid=33(www-data) gid=33(www-data) groups=33(www-data)
+این خروجی اثبات می‌کند که دستور آزمایشی روی هدف اجرا شده است.
+
+اسلاید ۲۸ ـ دریافت Flag و اثبات نهایی
+برای اثبات نهایی Exploit در آزمایشگاه، Task از یک فایل Flag استفاده می‌کند.
+فایل موردنظر در مسیر زیر قرار دارد:
+/f
+PoC آزمایشگاه امکان اجرای یک Command مشخص و ذخیره نتیجه آن در مسیر مشترک را فراهم می‌کند.
+دستور ارائه‌شده در آزمایشگاه:
+python3 exploit.py -u http://127.0.0.1:8088/index.php -c 'cat /f>/out/p1' --proof-file out/p1
+در صورت موفقیت، خروجی با PROOF: نمایش داده می‌شود.
+این آزمایش سه موضوع را اثبات می‌کند:
+1. ارتباط با سرویس HTTP برقرار است.
+2. مسیر Exploit توانسته اجرای دستور را روی هدف ایجاد کند.
+3. Command با سطح دسترسی Web Server اجرا شده است.
+این مراحل فقط برای ماشین آزمایشگاهی مجاز TryHackMe هستند و نباید روی سیستم‌های فاقد مجوز اجرا شوند.
+
+بخش پنجم: Detection و تحلیل SOC
+اسلاید ۲۹ ـ نگاه SOC به PHP2Shell
+از دید SOC، مهم‌ترین مسئله فقط شناسایی نسخه آسیب‌پذیر نیست.
+باید بتوانیم رفتارهای مرتبط با Exploitation را نیز در Telemetryهای مختلف شناسایی کنیم.
+در این سناریو چهار دسته داده اهمیت دارند:
+1. HTTP Request Logs
+2. HTTP Response Headers
+3. PHP و Apache Error Logs
+4. Endpoint و Process Telemetry
+یک تحلیلگر SOC باید بتواند ارتباط میان این داده‌ها را بررسی کند.
+برای مثال:
+- یک Multipart POST غیرعادی دریافت شده است.
+- پس از آن یک PHPSESSID بسیار بزرگ در Response ثبت شده است.
+- PHP Worker با خطای Memory مواجه شده است.
+- در ادامه Apache Child Process یک Shell ایجاد کرده است.
+وجود این مجموعه رفتارها می‌تواند نشانه بسیار مهمی از Exploitation باشد.
+
+اسلاید ۳۰ ـ Detection Indicator شماره ۱: غیرعادی بودن PHPSESSID
+یکی از مهم‌ترین شاخص‌های مطرح‌شده در مسیر Memory Disclosure، غیرعادی بودن مقدار PHPSESSID است.
+در حالت معمول، Session IDها بر اساس تنظیمات PHP دارای طول و ساختار مشخصی هستند.
+اما در مسیر Memory Disclosure ممکن است مقدار Session Cookie بسیار بزرگ‌تر از حالت عادی شود.
+محل بررسی:
+HTTP Response Headers
+Header:
+Set-Cookie: PHPSESSID=...
+مواردی که باید بررسی شوند:
+- طول Cookie
+- غیرعادی بودن مقدار Session ID
+- وجود داده‌های غیرمنتظره
+- تفاوت با Baseline معمول Application
+- تکرار Headerهای غیرعادی از یک Source IP
+نکته مهم برای SOC:
+بزرگ بودن Cookie به‌تنهایی اثبات Exploitation نیست.
+باید آن را در کنار Requestهای مشکوک، رفتار Worker و سایر شواهد بررسی کرد.
+همچنین Response Headerها باید توسط Reverse Proxy یا ابزار مناسب ثبت شده باشند؛ همه Access Logهای پیش‌فرض آن‌ها را ذخیره نمی‌کنند.
+
+اسلاید ۳۱ ـ Detection Indicator شماره ۲: Multipart POST غیرعادی
+یکی دیگر از نشانه‌های مهم، ساختار غیرعادی درخواست‌های Multipart است.
+موارد مشکوک:
+- تعداد بسیار زیاد Multipart Parts
+- تعداد زیاد Header در هر Part
+- تعداد غیرعادی Form Fieldها
+- درخواست‌های حجیم
+- Field مرتبط با PHP_SESSION_UPLOAD_PROGRESS
+- ارسال Multipart به Endpointهایی که اصولاً قابلیت File Upload ندارند
+در بررسی HTTP Logs باید موارد زیر استخراج شوند:
+- Source IP
+- Destination IP
+- HTTP Method
+- URI
+- Content-Type
+- Request Size
+- Response Status
+- User-Agent
+- تعداد درخواست‌ها در بازه زمانی
+نکته:
+وجود Multipart یا Upload Progress به‌تنهایی نشانه حمله نیست.
+بسیاری از Applicationهای قانونی برای Upload فایل از همین قابلیت استفاده می‌کنند.
+تحلیل باید بر اساس رفتار غیرعادی و Correlation انجام شود.
+
+اسلاید ۳۲ ـ Detection Indicator شماره ۳: Out Of Memory و Crash
+شرایط OOM می‌تواند در Logهای PHP و Web Server نشانه‌هایی ایجاد کند.
+نمونه پیام‌ها:
+Allowed memory size exhausted
+Out of memory
+zend_mm_heap corrupted
+همچنین ممکن است موارد زیر مشاهده شوند:
+- PHP Worker Crash
+- Apache Child Process Restart
+- SIGSEGV
+- SIGABRT
+- افزایش ناگهانی Error Rate
+- اختلال در پاسخ‌گویی Application
+منابع مناسب برای بررسی:
+- Apache Error Log
+- PHP Error Log
+- PHP-FPM Error Log
+- System Journal
+- Docker Container Logs
+- Operating System Logs
+نکته مهم:
+هر OOM یا Crash الزاماً نشانه Exploitation نیست.
+ممکن است یک Application به‌صورت عادی Memory Leak داشته باشد یا Request بسیار حجیمی دریافت کرده باشد.
+ارتباط زمانی این رخدادها با Multipart POST و سایر IOCها اهمیت دارد.
+
+اسلاید ۳۳ ـ Detection Indicator شماره ۴: Process Execution
+یکی از مهم‌ترین شواهد RCE، مشاهده Processهای غیرعادی است.
+برای مثال:
+Parent Process:
+apache2
+Child Process:
+sh
+یا:
+bash
+یا Processهایی مانند:
+whoami
+id
+uname
+curl
+wget
+این رفتار می‌تواند نشان‌دهنده اجرای Command توسط Web Server باشد.
+در بررسی Process Tree باید به موارد زیر توجه شود:
+- Parent Process
+- Child Process
+- User
+- Command Line
+- Process Start Time
+- Executable Path
+- Network Connections
+- File Creation Events
+اگر Process مربوط به Apache یا PHP-FPM اقدام به اجرای Shell کند، باید بررسی شود که آیا این رفتار بخشی از عملکرد مجاز Application است یا نشانه احتمالی RCE.
+نکته: اجرای Shell توسط Web Server همیشه مخرب نیست؛ برخی Applicationها به ابزارهای سیستمی نیاز دارند. Baseline و Context اهمیت دارند.
+
+اسلاید ۳۴ ـ منابع Telemetry برای Investigation
+برای بررسی کامل PHP2Shell باید چند منبع داده را با هم Correlate کنیم.
+Web Layer
+- Apache Access Logs
+- Apache Error Logs
+- Nginx Logs
+- Reverse Proxy Logs
+- WAF Logs
+PHP Layer
+- PHP Error Logs
+- PHP-FPM Logs
+- Runtime Configuration
+- Session Configuration
+Endpoint Layer
+- Process Creation
+- Command Line
+- Parent-Child Relationship
+- File Creation
+- Network Connections
+Infrastructure Layer
+- Docker Logs
+- Container Events
+- System Journal
+- Memory و CPU Usage
+- Worker Restart Events
+Network Layer
+- HTTP Method
+- Content-Type
+- Request Size
+- Response Header
+- Source IP
+- Destination IP
+ترکیب این منابع باعث می‌شود Detection از حالت بررسی یک Alert منفرد خارج شده و به یک Incident Investigation واقعی تبدیل شود.
+
+اسلاید ۳۵ ـ MITRE ATT&CK Mapping
+بر اساس رفتار مشاهده‌شده در Exploitation، تکنیک‌های مرتبط MITRE ATT&CK عبارت‌اند از:
+T1190 — Exploit Public-Facing Application
+مهاجم از یک سرویس قابل‌دسترسی از طریق شبکه برای Exploitation استفاده می‌کند.
+در PHP2Shell، سرویس PHP Web Application هدف قرار می‌گیرد.
+T1059.004 — Unix Shell
+در صورت اجرای دستور از طریق Shell، این تکنیک قابل‌استفاده است.
+T1005 — Data from Local System
+اگر مهاجم پس از RCE اقدام به خواندن اطلاعات حساس موجود روی سیستم کند، این تکنیک می‌تواند مطرح شود.
+نکته:
+MITRE Mapping باید بر اساس رفتار واقعی مشاهده‌شده انجام شود.
+صرف وجود CVE به معنی وقوع تمام تکنیک‌های بالا نیست.
+
+اسلاید ۳۶ ـ نمونه Detection Logic در Splunk
+برای شناسایی درخواست‌های غیرعادی Multipart می‌توان از یک Query اولیه استفاده کرد.
+نمونه مفهومی:
+index=web sourcetype=access_combined method=POST
+سپس بررسی درخواست‌هایی که Content-Type آن‌ها Multipart است.
+در صورت وجود فیلدهای مناسب:
+| search content_type="multipart/form-data"
+سپس:
+| stats count sum(request_bytes) as total_bytes values(uri_path) as paths by src_ip
+هدف Query:
+- شناسایی Source IPهای پرتکرار
+- بررسی تعداد درخواست‌ها
+- بررسی حجم داده ارسالی
+- شناسایی Endpointهای غیرعادی
+برای Detection پیشرفته‌تر باید موارد زیر نیز وارد تحلیل شوند:
+- تعداد Multipart Partها
+- تعداد Headerهای هر Part
+- وجود Upload Progress Field
+- Response Headerهای Set-Cookie
+- طول PHPSESSID
+- PHP Worker Errorها
+نکته اجرایی:
+نام Fieldها به Data Source و Parsing موجود در Splunk وابسته است. Query فوق یک Template مفهومی است و باید با Schema واقعی محیط تنظیم شود.
+
+اسلاید ۳۷ ـ Investigation Workflow برای SOC
+در صورت مشاهده Alert مشکوک مرتبط با PHP2Shell، مراحل زیر پیشنهاد می‌شود:
+مرحله اول: Asset Identification
+- شناسایی Web Server
+- شناسایی نسخه PHP
+- شناسایی نوع SAPI
+- بررسی Apache mod_php یا PHP-FPM
+- بررسی Container Image
+مرحله دوم: Request Analysis
+- بررسی HTTP POST
+- بررسی Multipart Content-Type
+- بررسی حجم Request
+- بررسی تعداد Multipart Partها
+- بررسی Upload Progress Field
+مرحله سوم: Response Analysis
+- بررسی Set-Cookie
+- بررسی طول PHPSESSID
+- بررسی Response Headerهای غیرعادی
+- مقایسه با Baseline
+مرحله چهارم: Runtime Analysis
+- بررسی PHP Error Logs
+- بررسی OOM
+- بررسی Worker Crash
+- بررسی Process Restart
+مرحله پنجم: Endpoint Investigation
+- بررسی Parent-Child Process
+- بررسی اجرای Shell
+- بررسی Command Line
+- بررسی File Creation
+- بررسی Network Connections
+مرحله ششم: Impact Assessment
+- بررسی فایل‌های حساس
+- بررسی Credentials
+- بررسی Session Data
+- بررسی API Keys
+- بررسی دسترسی‌های احتمالی بعدی
+مرحله هفتم: Containment و Remediation
+- محدود کردن دسترسی مهاجم
+- جلوگیری از ادامه Exploitation
+- Patch کردن PHP
+- Restart کردن Workerها
+- بررسی احتمال Compromise
+
+بخش ششم: Mitigation و Remediation
+اسلاید ۳۸ ـ راهکار اصلی: Patch Management
+مهم‌ترین راهکار و تنها راهکار کامل برای رفع دو آسیب‌پذیری اصلی، به‌روزرسانی PHP به نسخه‌های اصلاح‌شده است.
+نسخه‌های اصلاح‌شده:
+شاخهنسخه اصلاح‌شدهPHP 8.58.5.12PHP 8.48.4.27PHP 8.38.3.36PHP 8.28.2.35
+برای رفع آسیب‌پذیری باید PHP Package یا Base Image مورد استفاده در Container به نسخه اصلاح‌شده ارتقا پیدا کند.
+سپس تمام Workerها باید Restart شوند تا هیچ Process قدیمی همچنان از نسخه آسیب‌پذیر استفاده نکند.
+نکته مهم:
+در محیط‌هایی که Distribution از Security Backport استفاده می‌کند، ممکن است شماره نسخه ظاهری PHP پایین‌تر باشد؛ بنابراین باید وضعیت Patch را از Package Changelog و Security Advisory توزیع بررسی کرد.
+
+اسلاید ۳۹ ـ Mitigation موقت: غیرفعال کردن Upload Progress
+در صورتی که امکان Patch فوری وجود نداشته باشد، می‌توان قابلیت Upload Progress را غیرفعال کرد.
+تنظیم:
+session.upload_progress.enabled = 0
+این اقدام مسیرهای وابسته به Session Upload Progress را محدود می‌کند.
+اما باید توجه داشت که این تنظیم جایگزین Patch نیست و تمام مسیرهای OOM Corruption را پوشش نمی‌دهد.
+پس از اعمال تغییر باید تمام PHP Workerها Restart شوند.
+همچنین باید بررسی شود که Application به قابلیت نمایش Upload Progress وابستگی نداشته باشد.
+
+اسلاید ۴۰ ـ سایر اقدامات کاهش ریسک
+۱. محدود کردن Multipart Request
+اگر Application به File Upload نیاز ندارد، می‌توان Multipart Requestها را در Reverse Proxy یا Network Edge مسدود کرد.
+۲. اعمال محدودیت روی Request Size
+با محدود کردن اندازه Request و تعداد Partها می‌توان برخی مسیرهای مصرف غیرعادی حافظه را کاهش داد.
+۳. Least Privilege
+PHP Worker باید با حداقل دسترسی لازم اجرا شود.
+اجرای PHP با Root دسترسی مهاجم را در صورت موفقیت RCE به‌شدت افزایش می‌دهد.
+۴. بررسی تنظیمات PHP
+تنظیمات مربوط به Session، Upload و Memory باید بررسی شوند.
+۵. Restart Workerها
+پس از تغییر Configuration یا Patch باید Workerهای قدیمی متوقف شوند تا State قبلی در حافظه باقی نماند.
+۶. Container Image Management
+در محیط‌های Docker و Kubernetes باید Image اصلاح‌شده Build و Deploy شود.
+
+اسلاید ۴۱ ـ چرا WAF به‌تنهایی کافی نیست؟
+WAF یکی از لایه‌های مهم دفاعی در معماری Web Security است.
+اما محل اجرای WAF اهمیت زیادی دارد.
+اگر WAF به‌صورت یک PHP Module و داخل همان Runtime اجرا شود، ممکن است فرصت بررسی درخواست‌هایی را که پیش از Application Initialization پردازش می‌شوند نداشته باشد.
+بنابراین WAF داخل PHP به‌تنهایی راهکار مناسبی برای این نوع حمله نیست.
+در مقابل، Reverse Proxy یا WAF مستقل که پیش از رسیدن Request به PHP قرار دارد، می‌تواند برخی الگوهای مخرب را مسدود کند.
+با این حال:
+- WAF جایگزین Patch نیست.
+- Signatureهای WAF ممکن است ناقص باشند.
+- تغییر شکل Request می‌تواند Detection را دشوار کند.
+- مسدود کردن Multipart ممکن است File Upload قانونی را مختل کند.
+نتیجه:
+Patch کردن Runtime باید اولویت اول باشد و WAF فقط به‌عنوان یک لایه دفاعی تکمیلی در نظر گرفته شود.
+
+اسلاید ۴۲ ـ چرا آپدیت WordPress یا Laravel کافی نیست؟
+فرض کنید یک سازمان از Laravel روی PHP 8.4.26 استفاده می‌کند.
+با به‌روزرسانی Laravel، فقط Framework و کدهای مربوط به آن تغییر می‌کنند.
+اما PHP Runtime همچنان نسخه 8.4.26 باقی می‌ماند.
+بنابراین آسیب‌پذیری Runtime همچنان وجود خواهد داشت.
+همین مسئله برای WordPress، Drupal و Joomla نیز صدق می‌کند.
+تفاوت مهم:
+Application Patch با Runtime Patch متفاوت است.
+برای رفع PHP2Shell باید PHP Binary یا Package اصلاح شود، نه صرفاً کد Application.
+
+بخش هفتم: نتیجه‌گیری و منابع
+اسلاید ۴۳ ـ مهم‌ترین درس‌های امنیتی
+PHP2Shell چند درس مهم برای تیم‌های امنیتی دارد:
+۱. امنیت فقط به Application Code محدود نمی‌شود.
+۲. Runtime و Interpreter نیز بخشی از Attack Surface هستند.
+۳. مدیریت نادرست Memory و Exception می‌تواند به آسیب‌پذیری‌های بحرانی منجر شود.
+۴. Memory Disclosure می‌تواند اثربخشی ASLR را کاهش دهد.
+۵. Use-After-Free یکی از کلاس‌های خطرناک Memory Corruption است.
+۶. اجرای موفق RCE الزاماً به معنی Root Access نیست.
+۷. Detection مؤثر به Correlation میان Web Logs، Runtime Logs و Endpoint Telemetry نیاز دارد.
+۸. WAF به‌تنهایی نمی‌تواند تمام آسیب‌پذیری‌های Runtime را پوشش دهد.
+۹. Patch Management باید شامل PHP Runtime، Container Image و تمام Workerهای فعال باشد.
+۱۰. حتی Applicationهایی که از نظر Source Code سالم هستند ممکن است در معرض آسیب‌پذیری‌های Runtime قرار بگیرند.
+
+اسلاید ۴۴ ـ جمع‌بندی نهایی
+PHP2Shell نمونه‌ای از زنجیره‌ای است که در آن یک نقص در مدیریت حافظه و وضعیت داخلی Runtime می‌تواند به یک حمله کامل Remote Code Execution تبدیل شود.
+این زنجیره از پردازش Request آغاز می‌شود و با Memory Corruption، Memory Disclosure و دست‌کاری جریان اجرای برنامه ادامه پیدا می‌کند.
+در نهایت مهاجم می‌تواند با سطح دسترسی Web Server روی سیستم هدف دستور اجرا کند.
+مهم‌ترین اقدام دفاعی، به‌روزرسانی PHP به نسخه اصلاح‌شده و Restart کردن تمام Workerها است.
+از دید SOC نیز شناسایی این حمله باید با ترکیب چند نوع Telemetry انجام شود، نه صرفاً بررسی یک HTTP Request یا یک Error Log.
+Final Message:
+A secure application requires a secure runtime.
+
+اسلاید ۴۵ ـ منابع و References
+۱. PHP Official Security Advisory
+https://www.php.net/archive/2026.php#2026-10-21-5
+۲. PHP Official Changelog
+https://www.php.net/ChangeLog-8.php
+۳. GitHub Security Advisory – CVE-2026-109618
+https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w
+۴. GitHub Security Advisory – CVE-2026-109619
+https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp
+۵. PHP 8.4.27 Release Announcement
+https://news-web.php.net/php.announce/512
+۶. Red Hat Security Advisory – PHP2Shell
+https://access.redhat.com/security/vulnerabilities/RHSB-2026-013
+۷. CERT-EU Security Advisory
+https://cert.europa.eu/publications/security-advisories/2026-018/
+۸. MITRE CWE-416 – Use After Free
+https://cwe.mitre.org/data/definitions/416.html
+۹. MITRE CWE-824 – Access of Uninitialized Pointer
+https://cwe.mitre.org/data/definitions/824.html
+۱۰. MITRE ATT&CK – Exploit Public-Facing Application
+https://attack.mitre.org/techniques/T1190/
+۱۱. MITRE ATT&CK – Unix Shell
+https://attack.mitre.org/techniques/T1059/004/
+۱۲. TryHackMe – PHP2Shell Lab
+منبع عملی بازسازی آزمایشگاه و مشاهده زنجیره Exploitation.
+
+
+
+بر اساس محتوای ارائه PHP2Shell که در اختیار تو قرار گرفته، یک پاورپوینت حرفه‌ای و تخصصی در حوزه Cybersecurity Research تولید کن.
+مشخصات کلی
+- زبان اسلایدها: فارسی
+- اصطلاحات تخصصی: انگلیسی و بدون ترجمه غیرضروری
+- جهت متن: RTL برای فارسی
+- نسبت تصویر: 16:9
+- سبک طراحی: Dark Cybersecurity / SOC Dashboard / Technical Research
+- سطح محتوا: Advanced / Professional
+- مخاطب: SOC Analysts، Security Engineers و متخصصان امنیت سایبری
+الزامات طراحی
+1. از طراحی حرفه‌ای با پس‌زمینه تیره و رنگ‌های محدود استفاده کن.
+2. برای نمایش Attack Chain از Flowchart استفاده کن.
+3. برای توضیح Memory Corruption از دیاگرام Memory Layout استفاده کن.
+4. برای توضیح Dangling Pointer و Use-After-Free، وضعیت حافظه را قبل و بعد از Free شدن نمایش بده.
+5. برای توضیح ASLR، آدرس‌های حافظه در دو اجرای متفاوت را مقایسه کن.
+6. معماری Apache، mod_php و PHP Runtime را با دیاگرام نمایش بده.
+7. مسیر HTTP Request تا اجرای PHP Code را به‌صورت مرحله‌ای نمایش بده.
+8. تفاوت Normal Cleanup و Bailout را به‌صورت تصویری نشان بده.
+9. برای CVE-2026-109618 و CVE-2026-109619 دو اسلاید تحلیلی مجزا داشته باش.
+10. برای بخش SOC از نمونه Log، HTTP Header، Process Tree و Detection Workflow استفاده کن.
+11. برای Mitigation از جدول مقایسه‌ای استفاده کن.
+12. کدهای Bash، PHP و Configuration را در Code Blockهای خوانا قرار بده.
+الزامات محتوایی
+- هیچ‌یک از اسلایدهای اصلی را حذف نکن.
+- مطالب فنی را به جملات سطحی و کوتاه تبدیل نکن.
+- برای هر اسلاید یک توضیح تکمیلی در Speaker Notes قرار بده.
+- اصطلاحات تخصصی مانند Memory Disclosure، ASLR، Heap، Dangling Pointer، Bailout و RCE را حفظ کن.
+- از تصاویر تزئینی غیرمرتبط استفاده نکن.
+- دیاگرام‌ها باید از نظر فنی با محتوای اسلاید سازگار باشند.
+- شماره CVEها و نسخه‌های PHP را دقیق نمایش بده.
+- اطلاعات تأییدنشده را به‌عنوان واقعیت قطعی نمایش نده.
+- بخش Detection باید برای یک محیط واقعی SOC کاربردی باشد.
+- در انتهای ارائه منابع رسمی PHP، GitHub Security Advisory، MITRE و CERT-EU درج شوند.
+نحوه ارائه
+ارائه باید یک داستان فنی منسجم داشته باشد:
+Introduction
+→ PHP Runtime Architecture
+→ Session Upload Progress
+→ Memory Management
+→ Bailout
+→ Dangling Pointer
+→ CVE Analysis
+→ Memory Disclosure
+→ ASLR Bypass
+→ RCE
+→ Lab Demonstration
+→ SOC Detection
+→ Incident Response
+→ Mitigation
+→ Conclusion
+هر اسلاید باید یک پیام مشخص داشته باشد و از شلوغ کردن اسلایدها خودداری شود.
+در اسلایدهای پیچیده، به‌جای متن زیاد از دیاگرام استفاده کن؛ اما جزئیات کامل را در Speaker Notes حفظ کن.
